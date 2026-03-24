@@ -1,0 +1,112 @@
+--- a/packages/proxy/.env.example
++++ b/packages/proxy/.env.example
+@@ -5,3 +5,6 @@ RAVEN_TOKEN_PATH=data/github_token
+ RAVEN_LOG_LEVEL=info
+ RAVEN_BASE_URL=
++
++# Web Search: set Tavily API key to intercept Claude Code's web_search and use Tavily instead
++TAVILY_API_KEY=
+--- a/packages/proxy/src/routes/messages/non-stream-translation.ts
++++ b/packages/proxy/src/routes/messages/non-stream-translation.ts
+@@ -290,13 +290,30 @@ function translateAnthropicToolsToOpenAI(
+   if (!anthropicTools) {
+     return undefined
+   }
+-  return anthropicTools.map((tool) => ({
++  // Strip server tools (web_search_20250305 etc.) — no input_schema, can't translate
++  const clientTools = anthropicTools.filter(
++    (t: any) => !t.type?.startsWith("web_search_"),
++  )
++  const tools = clientTools.map((tool) => ({
+     type: "function",
+     function: {
+       name: tool.name,
+       description: tool.description,
+       parameters: tool.input_schema,
+     },
+-  }))
++  })) as Array<Tool>
++  // Inject web_search as a regular function tool when Tavily is configured
++  if (process.env.TAVILY_API_KEY && clientTools.length < anthropicTools.length) {
++    tools.push({
++      type: "function",
++      function: {
++        name: "web_search",
++        description: "Search the web for current information",
++        parameters: {
++          type: "object",
++          properties: { query: { type: "string" } },
++          required: ["query"],
++        },
++      },
++    })
++  }
++  return tools
+ }
+--- a/packages/proxy/src/routes/messages/handler.ts
++++ b/packages/proxy/src/routes/messages/handler.ts
+@@ -55,11 +55,50 @@ export async function handleCompletion(c: Context) {
+
+   const openAIPayload = translateToOpenAI(anthropicPayload)
+
++  // Force non-streaming when web search is active (Tavily needs full response)
++  const hasWebSearchTool = process.env.TAVILY_API_KEY
++    && anthropicPayload.tools?.some((t: any) => t.type?.startsWith("web_search_"))
++  if (hasWebSearchTool) openAIPayload.stream = false
++
+   try {
+     const response = await createChatCompletions(openAIPayload)
+
+     if (isNonStreaming(response)) {
+-      const anthropicResponse = translateToAnthropic(response)
++      // Web search interception loop (max 3 retries)
++      let finalResp = response
++      let wsRetries = 0
++      while (wsRetries < 3) {
++        const wsCall = finalResp.choices[0]?.message?.tool_calls?.find(
++          (tc) => tc.function.name === "web_search",
++        )
++        if (!wsCall || !process.env.TAVILY_API_KEY) break
++        wsRetries++
++
++        let resultText = "Web search unavailable."
++        try {
++          const tavily = await fetch("https://api.tavily.com/search", {
++            method: "POST",
++            headers: {
++              "Content-Type": "application/json",
++              Authorization: `Bearer ${process.env.TAVILY_API_KEY}`,
++            },
++            body: JSON.stringify({
++              query: JSON.parse(wsCall.function.arguments).query,
++              max_results: 5,
++            }),
++          }).then((r) => r.json() as any)
++          resultText = (tavily.results ?? [])
++            .map((r: any) => `### ${r.title}\n${r.url}\n${r.content}`)
++            .join("\n\n")
++        } catch { /* Tavily down — use fallback */ }
++
++        finalResp = (await createChatCompletions({
++          ...openAIPayload,
++          stream: false,
++          messages: [
++            ...openAIPayload.messages,
++            {
++              role: "assistant",
++              content: finalResp.choices[0].message.content,
++              tool_calls: [wsCall],
++            },
++            { role: "tool", tool_call_id: wsCall.id, content: resultText },
++          ],
++        })) as ChatCompletionResponse
++      }
++
++      const anthropicResponse = translateToAnthropic(finalResp)
+       const latencyMs = Math.round(performance.now() - startTime)
+-      const cachedTokens = response.usage?.prompt_tokens_details?.cached_tokens ?? 0
+-      const inputTokens = (response.usage?.prompt_tokens ?? 0) - cachedTokens
+-      const outputTokens = response.usage?.completion_tokens ?? 0
++      const cachedTokens = finalResp.usage?.prompt_tokens_details?.cached_tokens ?? 0
++      const inputTokens = (finalResp.usage?.prompt_tokens ?? 0) - cachedTokens
++      const outputTokens = finalResp.usage?.completion_tokens ?? 0

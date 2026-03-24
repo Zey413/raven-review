@@ -6,107 +6,93 @@
 +
 +# Web Search: set Tavily API key to intercept Claude Code's web_search and use Tavily instead
 +TAVILY_API_KEY=
---- a/packages/proxy/src/routes/messages/non-stream-translation.ts
-+++ b/packages/proxy/src/routes/messages/non-stream-translation.ts
-@@ -290,13 +290,30 @@ function translateAnthropicToolsToOpenAI(
-   if (!anthropicTools) {
-     return undefined
-   }
--  return anthropicTools.map((tool) => ({
-+  // Strip server tools (web_search_20250305 etc.) — no input_schema, can't translate
-+  const clientTools = anthropicTools.filter(
-+    (t: any) => !t.type?.startsWith("web_search_"),
-+  )
-+  const tools = clientTools.map((tool) => ({
-     type: "function",
-     function: {
-       name: tool.name,
-       description: tool.description,
-       parameters: tool.input_schema,
-     },
--  }))
-+  })) as Array<Tool>
-+  // Inject web_search as a regular function tool when Tavily is configured
-+  if (process.env.TAVILY_API_KEY && clientTools.length < anthropicTools.length) {
-+    tools.push({
-+      type: "function",
-+      function: {
-+        name: "web_search",
-+        description: "Search the web for current information",
-+        parameters: {
-+          type: "object",
-+          properties: { query: { type: "string" } },
-+          required: ["query"],
-+        },
-+      },
-+    })
-+  }
-+  return tools
- }
 --- a/packages/proxy/src/routes/messages/handler.ts
 +++ b/packages/proxy/src/routes/messages/handler.ts
-@@ -55,11 +55,50 @@ export async function handleCompletion(c: Context) {
+@@ -29,6 +29,77 @@
+ export async function handleCompletion(c: Context) {
+   const startTime = performance.now()
+   const requestId = generateRequestId()
 
-   const openAIPayload = translateToOpenAI(anthropicPayload)
+   await checkRateLimit(state)
 
-+  // Force non-streaming when web search is active (Tavily needs full response)
-+  const hasWebSearchTool = process.env.TAVILY_API_KEY
-+    && anthropicPayload.tools?.some((t: any) => t.type?.startsWith("web_search_"))
-+  if (hasWebSearchTool) openAIPayload.stream = false
+   const anthropicPayload = await c.req.json<AnthropicMessagesPayload>()
 +
-   try {
-     const response = await createChatCompletions(openAIPayload)
-
-     if (isNonStreaming(response)) {
--      const anthropicResponse = translateToAnthropic(response)
-+      // Web search interception loop (max 3 retries)
-+      let finalResp = response
-+      let wsRetries = 0
-+      while (wsRetries < 3) {
-+        const wsCall = finalResp.choices[0]?.message?.tool_calls?.find(
-+          (tc) => tc.function.name === "web_search",
-+        )
-+        if (!wsCall || !process.env.TAVILY_API_KEY) break
-+        wsRetries++
++  // === Web Search Interception (Tavily) ===
++  // Claude Code sends a separate sub-request for web search with
++  // {type: "web_search_20250305"} in the tools array.
++  // We intercept it here and call Tavily instead of forwarding to Copilot.
++  const webSearchServerTool = (anthropicPayload as any).tools?.find(
++    (t: any) => typeof t.type === "string" && t.type.startsWith("web_search_"),
++  )
++  if (webSearchServerTool && process.env.TAVILY_API_KEY) {
++    const firstMsg = anthropicPayload.messages[0]
++    const rawContent =
++      typeof firstMsg?.content === "string"
++        ? firstMsg.content
++        : Array.isArray(firstMsg?.content)
++          ? firstMsg.content
++              .filter((b: any) => b.type === "text")
++              .map((b: any) => b.text)
++              .join(" ")
++          : ""
++    const query = rawContent.replace(/^Perform a web search for the query:\s*/i, "").trim()
 +
-+        let resultText = "Web search unavailable."
-+        try {
-+          const tavily = await fetch("https://api.tavily.com/search", {
-+            method: "POST",
-+            headers: {
-+              "Content-Type": "application/json",
-+              Authorization: `Bearer ${process.env.TAVILY_API_KEY}`,
-+            },
-+            body: JSON.stringify({
-+              query: JSON.parse(wsCall.function.arguments).query,
-+              max_results: 5,
-+            }),
-+          }).then((r) => r.json() as any)
-+          resultText = (tavily.results ?? [])
-+            .map((r: any) => `### ${r.title}\n${r.url}\n${r.content}`)
-+            .join("\n\n")
-+        } catch { /* Tavily down — use fallback */ }
++    let searchResults: Array<{ url: string; title: string; content: string }> = []
++    try {
++      const tavilyResp = await fetch("https://api.tavily.com/search", {
++        method: "POST",
++        headers: {
++          "Content-Type": "application/json",
++          Authorization: `Bearer ${process.env.TAVILY_API_KEY}`,
++        },
++        body: JSON.stringify({ query, max_results: 5 }),
++      })
++      const tavilyData = (await tavilyResp.json()) as any
++      searchResults = tavilyData.results ?? []
++    } catch { /* Tavily unavailable */ }
 +
-+        finalResp = (await createChatCompletions({
-+          ...openAIPayload,
-+          stream: false,
-+          messages: [
-+            ...openAIPayload.messages,
-+            {
-+              role: "assistant",
-+              content: finalResp.choices[0].message.content,
-+              tool_calls: [wsCall],
-+            },
-+            { role: "tool", tool_call_id: wsCall.id, content: resultText },
-+          ],
-+        })) as ChatCompletionResponse
++    const srvId = `srvtoolu_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
++    const responseBody = {
++      id: `msg_${requestId}`,
++      type: "message",
++      role: "assistant",
++      model: anthropicPayload.model,
++      content: [
++        { type: "server_tool_use", id: srvId, name: "web_search", input: { query } },
++        {
++          type: "web_search_tool_result",
++          tool_use_id: srvId,
++          content: searchResults.map((r) => ({
++            type: "web_search_result", url: r.url, title: r.title,
++            encrypted_content: "", page_age: null,
++          })),
++        },
++        {
++          type: "text",
++          text: searchResults.length
++            ? searchResults.map((r) => `${r.title}\n${r.url}\n${r.content}`).join("\n\n---\n\n")
++            : "No results found.",
++        },
++      ],
++      stop_reason: "end_turn",
++      stop_sequence: null,
++      usage: { input_tokens: 0, output_tokens: 0 },
++    }
++
++    if (!anthropicPayload.stream) {
++      return c.json(responseBody)
++    }
++
++    return streamSSE(c, async (sseStream) => {
++      await sseStream.writeSSE({ event: "message_start", data: JSON.stringify({ type: "message_start", message: { ...responseBody, content: [], stop_reason: null } }) })
++      for (let i = 0; i < responseBody.content.length; i++) {
++        await sseStream.writeSSE({ event: "content_block_start", data: JSON.stringify({ type: "content_block_start", index: i, content_block: responseBody.content[i] }) })
++        await sseStream.writeSSE({ event: "content_block_stop", data: JSON.stringify({ type: "content_block_stop", index: i }) })
 +      }
++      await sseStream.writeSSE({ event: "message_delta", data: JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 0 } }) })
++      await sseStream.writeSSE({ event: "message_stop", data: JSON.stringify({ type: "message_stop" }) })
++    })
++  }
++  // === End Web Search Interception ===
 +
-+      const anthropicResponse = translateToAnthropic(finalResp)
-       const latencyMs = Math.round(performance.now() - startTime)
--      const cachedTokens = response.usage?.prompt_tokens_details?.cached_tokens ?? 0
--      const inputTokens = (response.usage?.prompt_tokens ?? 0) - cachedTokens
--      const outputTokens = response.usage?.completion_tokens ?? 0
-+      const cachedTokens = finalResp.usage?.prompt_tokens_details?.cached_tokens ?? 0
-+      const inputTokens = (finalResp.usage?.prompt_tokens ?? 0) - cachedTokens
-+      const outputTokens = finalResp.usage?.completion_tokens ?? 0
+   const model = anthropicPayload.model
